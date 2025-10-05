@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Placeholder implementation for SINQ linear method integration."""
+"""Linear method scaffolding for SINQ quantization."""
 
 from __future__ import annotations
 
-import importlib
-from typing import Optional, Protocol
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -19,76 +19,38 @@ from .sinq import SinqConfig
 logger = init_logger(__name__)
 
 
-_RUNTIME_MODULE_CANDIDATES = (
-    "sinq.torch",
-    "sinq.runtime",
-    "sinq",
-)
+@dataclass
+class _SinqWeights:
+    """Container tracking tensors required by the SINQ kernel."""
 
-
-class _RuntimeLinearAPI(Protocol):
-    def create_linear_weights(
-        self,
-        layer: torch.nn.Module,
-        config: SinqConfig,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ) -> None:
-        ...
-
-    def linear_forward(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        config: SinqConfig,
-        bias: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        ...
-
-
-def _load_runtime_module() -> _RuntimeLinearAPI:
-    """Import the runtime helper exposed by the external SINQ package."""
-
-    for module_name in _RUNTIME_MODULE_CANDIDATES:
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError:
-            continue
-
-        create_fn = getattr(module, "create_linear_weights", None)
-        forward_fn = getattr(module, "linear_forward", None)
-        if callable(create_fn) and callable(forward_fn):
-            return module  # type: ignore[return-value]
-
-    raise RuntimeError(
-        "SINQ runtime integration requires an external Python package that "
-        "exposes `create_linear_weights` and `linear_forward` helpers. "
-        "Install the development SINQ package and ensure it is importable."
-    )
+    packed_weights: Optional[torch.Tensor] = None
+    scale: Optional[torch.Tensor] = None
+    zero_point: Optional[torch.Tensor] = None
+    scale_2: Optional[torch.Tensor] = None
+    codebook: Optional[torch.Tensor] = None
 
 
 class SinqLinearMethod(LinearMethodBase):
-    """Linear method placeholder for SINQ quantization."""
+    """Linear method stub that delegates to the fused SINQ CUDA kernel."""
+
+    _STATE_ATTR = "_sinq_weights_state"
 
     def __init__(self, config: SinqConfig):
         self.config = config
         if not config.has_external_kernel:
             logger.warning(
-                "SINQ CUDA sources were not located automatically. The "
-                "external repository is expected at a sibling 'SINQ' "
-                "directory (e.g. /workspace/vllm/SINQ) so the kernel can "
-                "be built."
+                "SINQ CUDA sources were not located automatically. Place the "
+                "active SINQ checkout next to the vLLM repository so the "
+                "kernel can be built and linked."
             )
-        self._runtime_module: Optional[_RuntimeLinearAPI] = None
 
-    def _get_runtime(self) -> _RuntimeLinearAPI:
-        if self._runtime_module is None:
-            self._runtime_module = _load_runtime_module()
-        return self._runtime_module
+    @staticmethod
+    def _ensure_state(layer: torch.nn.Module) -> _SinqWeights:
+        state = getattr(layer, SinqLinearMethod._STATE_ATTR, None)
+        if state is None:
+            state = _SinqWeights()
+            setattr(layer, SinqLinearMethod._STATE_ATTR, state)
+        return state
 
     def create_weights(
         self,
@@ -100,17 +62,18 @@ class SinqLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        runtime = self._get_runtime()
-        runtime.create_linear_weights(
-            layer,
-            self.config,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
+        """Prepare the layer to receive externally quantized SINQ weights."""
+
+        self._ensure_state(layer)
+
+        # The real weight loader is responsible for populating the state with
+        # packed tensors. Until the kernel artifacts are linked in, we only
+        # stash metadata on the module so downstream tooling can introspect it.
+        layer.sinq_weight_bits = self.config.weight_bits
+        layer.sinq_group_size = self.config.group_size
+        layer.sinq_use_zero_point = self.config.use_zp
+        layer.sinq_pack_factor = self.config.pack_factor
+        layer.sinq_kernel_version = self.config.kernel_version
 
     def apply(
         self,
@@ -118,5 +81,36 @@ class SinqLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        runtime = self._get_runtime()
-        return runtime.linear_forward(layer, x, self.config, bias=bias)
+        weights = getattr(layer, self._STATE_ATTR, None)
+        if not isinstance(weights, _SinqWeights) or weights.packed_weights is None:
+            raise RuntimeError(
+                "SINQ weights have not been loaded. Ensure the checkpoint "
+                "provides pre-quantized tensors compatible with the SINQ kernel."
+            )
+
+        try:
+            sinq_op = torch.ops._C.sinq_linear_forward
+        except AttributeError as exc:  # pragma: no cover - depends on extension
+            raise RuntimeError(
+                "SINQ CUDA kernels are unavailable. Rebuild vLLM with the "
+                "external SINQ sources to enable the fused WMMA path."
+            ) from exc
+
+        runtime_meta = {
+            "weight_bits": int(self.config.weight_bits),
+            "group_size": int(self.config.group_size),
+            "use_zero_point": bool(self.config.use_zp),
+            "pack_factor": int(self.config.pack_factor or 0),
+            "kernel_version": self.config.kernel_version,
+        }
+
+        return sinq_op(
+            x,
+            weights.packed_weights,
+            weights.scale,
+            weights.zero_point,
+            weights.scale_2,
+            weights.codebook,
+            runtime_meta,
+            bias,
+        )

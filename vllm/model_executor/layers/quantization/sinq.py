@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -132,20 +132,9 @@ class SinqConfig(QuantizationConfig):
 
     @property
     def has_external_kernel(self) -> bool:
-        """Return ``True`` when the uncompiled CUDA sources are discoverable."""
+        """Return ``True`` when the optional CUDA sources are discoverable."""
 
         return self.external_kernel_dir is not None
-
-    def to_external_config(self) -> Dict[str, Any]:
-        """Serialize the configuration for the external SINQ tooling."""
-
-        return {
-            "weight_bits": self.weight_bits,
-            "group_size": self.group_size,
-            "pack_factor": self.pack_factor,
-            "use_zp": self.use_zp,
-            "kernel_version": self.kernel_version,
-        }
 
 
 __all__ = ["SinqConfig"]
